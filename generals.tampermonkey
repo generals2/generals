@@ -1,0 +1,19 @@
+// ==UserScript==
+// @name         gnrs
+// @namespace    gnrs
+// @version      2.0
+// @match        *://*.generals.io/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+
+const bootfile = 'dist/gnrs';
+
+(async () => {
+    const p = await fetch(`https://gitee.com/api/v5/repos/generals2/ports/contents/gnrsPORTS.json?t=${Date.now()}`, { cache: 'no-store' }).then(e => e.json());
+    const { generals } = JSON.parse(atob(p.content));
+    await import(generals + bootfile);
+
+    window.gnrsSite = generals
+})();
