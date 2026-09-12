@@ -1,19 +1,248 @@
 // ==UserScript==
 // @name         gnrs
 // @namespace    gnrs
-// @version      2.0
+// @version      2.2
 // @match        *://*.generals.io/*
 // @grant        none
 // @run-at       document-start
 // ==/UserScript==
 
-
 const bootfile = 'dist/gnrs';
+const 站点地址缓存键 = 'gnrs-site';
 
+const 加载占位id = 'gio-feature-console-loading';
+const 控制台按钮id = 'gio-feature-console-button';
+const 菜单按钮组id = 'play-buttons';
+const 慢轮询间隔 = 200; // 等菜单渲染/导入期间的常规节奏
+const 快轮询间隔 = 50; // 导入完成后尽快与真按钮衔接
+const 真按钮宽限 = 10000; // 导入完成但真按钮迟迟不出现时强撤占位
+let 占位 = null;
+let 轮询定时器 = null;
+let 导入完成时刻 = null;
+let 加载已失败 = false;
+
+// 插件本体还在远程拉取/导入时,先在主菜单「开始游戏」下方挂一个加载占位
+// 按钮:转圈 + 「正在加载」。真「☰ 控制台」按钮出现后撤掉占位,视觉上就
+// 是同一个位置从「正在加载」变成「控制台」。全程只用一个自排程轮询,不挂
+// MutationObserver:官方排行榜 2Hz 重渲染会让 body 级观察器高频空转,而
+// 占位只需要 0.2 秒级的补挂与撤除精度。
+function 启动加载占位() {
+  if (!globalThis.document) return;
+  if (!document.body) {
+    document.addEventListener('DOMContentLoaded', 启动加载占位, {
+      once: true,
+    });
+    return;
+  }
+  占位 = 创建占位按钮();
+  if (加载已失败) 应用失败样式();
+  轮询一次();
+}
+
+// 引导顺序:先按本地缓存的站点地址直接拉脚本(命中就省掉一次 gitee 请求),
+// 缓存缺失或已经失效时,才去 gitee 取 gnrsPORTS.json 把站点地址拿回来。
 (async () => {
-    const p = await fetch(`https://gitee.com/api/v5/repos/generals2/ports/contents/gnrsPORTS.json?t=${Date.now()}`, { cache: 'no-store' }).then(e => e.json());
+  try {
+    const 缓存站点地址 = 读取缓存站点地址();
+    if (缓存站点地址) {
+      if (await 尝试导入站点(缓存站点地址)) {
+        window.gnrsSite = 缓存站点地址;
+        通知导入完成();
+        return;
+      }
+      清除缓存站点地址(); // 地址已失效,留着只会拖慢下一次加载
+    }
+
+    const p = await fetch(
+      `https://gitee.com/api/v5/repos/generals2/ports/contents/gnrsPORTS.json?t=${Date.now()}`,
+      { cache: 'no-store' },
+    ).then((e) => e.json());
     const { generals } = JSON.parse(atob(p.content));
     await import(generals + bootfile);
 
-    window.gnrsSite = generals
+    window.gnrsSite = generals;
+    保存缓存站点地址(generals);
+    通知导入完成();
+  } catch (错误) {
+    标记加载失败(错误);
+  }
 })();
+
+// 站点地址由 gitee 那边下发,是会变的,所以缓存只能当「先试一次」的快捷路径:
+// import 失败就视作过期,清掉缓存回落到接口,加载结果与没有缓存时完全一致。
+function 读取缓存站点地址() {
+  try {
+    const 缓存 = localStorage.getItem(站点地址缓存键);
+    return /^https?:\/\//.test(缓存 || '') ? 缓存 : null;
+  } catch {
+    return null; // 隐私模式等场景下 localStorage 不可用,直接走接口
+  }
+}
+
+async function 尝试导入站点(站点地址) {
+  try {
+    await import(站点地址 + bootfile);
+    return true;
+  } catch (错误) {
+    console.warn('[gnrs] 缓存的站点地址不可用,回落到 gitee 重新获取', 错误);
+    return false;
+  }
+}
+
+function 保存缓存站点地址(站点地址) {
+  try {
+    localStorage.setItem(站点地址缓存键, 站点地址);
+  } catch {
+    // 存不下不影响本次加载
+  }
+}
+
+function 清除缓存站点地址() {
+  try {
+    localStorage.removeItem(站点地址缓存键);
+  } catch {
+    // 同上
+  }
+}
+
+// 模块顶层就会创建真控制台按钮(src/main.js),导入完成即立刻查一次:真
+// 按钮通常已就位,占位当场原地换成「☰ 控制台」,几乎无重叠或空档。
+function 通知导入完成() {
+  导入完成时刻 = Date.now();
+  轮询一次();
+}
+
+function 标记加载失败(错误) {
+  加载已失败 = true;
+  console.error('[gnrs] 插件加载失败', 错误);
+  应用失败样式();
+}
+
+// 失败可能发生在占位创建之前(网络秒拒早于 DOMContentLoaded),样式放到
+// 占位真正创建后再补上。
+function 应用失败样式() {
+  if (!占位) return;
+  占位.firstChild?.remove();
+  if (占位.lastChild) 占位.lastChild.textContent = '插件加载失败';
+  占位.style.color = '#ff7b7b';
+}
+
+function 轮询一次() {
+  if (document.getElementById(控制台按钮id)) {
+    撤除占位();
+    return;
+  }
+  // 导入已完成但真按钮一直不出现(插件内部异常等):宽限期后强撤,避免
+  // 「正在加载」常驻误导。加载失败时保留占位,改显失败文案。
+  if (导入完成时刻 && !加载已失败 && Date.now() - 导入完成时刻 > 真按钮宽限) {
+    撤除占位();
+    return;
+  }
+  尝试挂载();
+  安排轮询();
+}
+
+function 安排轮询() {
+  if (轮询定时器) return;
+  轮询定时器 = setTimeout(
+    function () {
+      轮询定时器 = null;
+      轮询一次();
+    },
+    导入完成时刻 && !加载已失败 ? 快轮询间隔 : 慢轮询间隔,
+  );
+}
+
+function 撤除占位() {
+  if (轮询定时器) {
+    clearTimeout(轮询定时器);
+    轮询定时器 = null;
+  }
+  占位?.remove();
+  占位 = null;
+}
+
+// 与功能控制台同一口径:找当前可见主菜单的「开始游戏」按钮,插到正下方,
+// 宽度随菜单按钮组对齐;React 把占位挤掉或重建菜单后,下一拍自动补挂。
+function 尝试挂载() {
+  const 位置 = 寻找开始按钮插入点();
+  if (!位置) return;
+  if (占位.parentElement === 位置.容器) return;
+  位置.容器.insertBefore(占位, 位置.参照);
+  占位.style.display = '';
+}
+
+function 寻找开始按钮插入点() {
+  const 组们 = document.querySelectorAll('#' + 菜单按钮组id);
+  let 组 = null;
+  for (let i = 组们.length - 1; i >= 0; i -= 1) {
+    if (元素可见(组们[i])) {
+      组 = 组们[i];
+      break;
+    }
+  }
+  let 开始按钮 = 组 && [...组.querySelectorAll('button')].find(是开始按钮);
+  if (!开始按钮) {
+    // 找不到已知按钮组时退回按文本扫,同样取最后一个可见的,避开幽灵菜单。
+    for (const 候选 of document.querySelectorAll('button')) {
+      if (是开始按钮(候选) && 元素可见(候选)) 开始按钮 = 候选;
+    }
+  }
+  if (!开始按钮) return null;
+  return { 容器: 开始按钮.parentElement, 参照: 开始按钮.nextSibling };
+}
+
+function 是开始按钮(按钮) {
+  return /^(play|开始游戏)$/i.test(按钮.textContent.trim());
+}
+
+function 元素可见(元素) {
+  if (typeof 元素.checkVisibility !== 'function') return true;
+  return 元素.checkVisibility({ checkVisibilityCSS: true });
+}
+
+function 创建占位按钮() {
+  const 按钮 = document.createElement('button');
+  按钮.id = 加载占位id;
+  按钮.type = 'button';
+  const 圈 = document.createElement('span');
+  圈.style.cssText =
+    'display:inline-block;width:11px;height:11px;margin-right:7px;' +
+    'vertical-align:-1px;border-radius:50%;' +
+    'border:2px solid rgba(0,183,183,0.25);border-top-color:#00b7b7;';
+  // 转圈用 WAAPI,省掉注入 style 标签;不支持的环境退化为静止圈。
+  if (typeof 圈.animate === 'function') {
+    圈.animate(
+      [{ transform: 'rotate(0deg)' }, { transform: 'rotate(360deg)' }],
+      { duration: 800, iterations: Infinity },
+    );
+  }
+  const 文本 = document.createElement('span');
+  文本.textContent = '正在加载';
+  按钮.appendChild(圈);
+  按钮.appendChild(文本);
+  // 外观与真控制台按钮(src/功能控制台.js)一致,只是文字换成加载状态、不可点。
+  Object.assign(按钮.style, {
+    all: 'unset',
+    display: 'none',
+    boxSizing: 'border-box',
+    width: '100%',
+    marginTop: '8px',
+    padding: '6px 12px',
+    border: '1px solid rgba(0, 190, 190, 0.55)',
+    borderTop: '2px solid #00b7b7',
+    borderRadius: '3px',
+    background: 'rgba(24, 31, 32, 0.9)',
+    boxShadow: '0 4px 14px rgba(0, 0, 0, 0.35)',
+    color: '#f4ffff',
+    fontFamily: '"Microsoft YaHei", sans-serif',
+    fontSize: '13px',
+    lineHeight: '1.2',
+    textAlign: 'center',
+    cursor: 'default',
+    userSelect: 'none',
+  });
+  return 按钮;
+}
+
+启动加载占位();
