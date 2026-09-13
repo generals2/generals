@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         gnrs
 // @namespace    gnrs
-// @version      2.2
+// @version      2.4
 // @match        *://*.generals.io/*
 // @grant        none
 // @run-at       document-start
@@ -20,6 +20,26 @@ let 占位 = null;
 let 轮询定时器 = null;
 let 导入完成时刻 = null;
 let 加载已失败 = false;
+const 最低浏览器版本 = 150; // Chrome/Edge 版本低于此门槛就弹窗提示升级
+const 回放路径前缀 = /^\/replays\//;
+const 回放加载宽限 = 15000; // 回放遮罩兜底:插件卡死时不能永久挡住回放页
+const 回放失败停留 = 2000; // 回放加载失败后失败文案的停留时长
+// 回放暂停轮询间隔:插件生效前回放一步都不该走,找到 store 后立刻暂停,
+// 用不着等下一拍。
+const 回放暂停轮询间隔 = 100;
+// 从 #game-page 沿 return 链向上找 Provider 的最大跳数(只防异常树死循环)。
+const fiber上行跳数上限 = 64;
+const fiber键前缀列表 = ['__reactInternalInstance$', '__reactFiber$'];
+// 官方切换回放自动播放的动作(module 4210 的 setAutoPlay):
+// Game_set_autoPlay + val,val 为 false 即暂停。
+const 官方设置自动播放动作 = 'Game_set_autoPlay';
+let 回放加载遮罩 = null;
+let 回放加载超时 = null;
+let 回放键盘屏蔽 = null;
+let 回放暂停轮询 = null;
+// 被引导脚本暂停的回放所在仓库;null 表示没暂停过,撤遮罩时不能替用户
+// 把回放点开。
+let 回放被暂停的仓库 = null;
 
 // 插件本体还在远程拉取/导入时,先在主菜单「开始游戏」下方挂一个加载占位
 // 按钮:转圈 + 「正在加载」。真「☰ 控制台」按钮出现后撤掉占位,视觉上就
@@ -105,16 +125,325 @@ function 清除缓存站点地址() {
   }
 }
 
+// ---- 浏览器版本检查 ----
+// 插件依赖较新的 Chromium 特性,非 Chrome/Edge 内核或版本低于门槛的浏览器
+// 直接弹窗提示升级,避免在跑不动的环境里静默失败;检查只提示,不阻断加载。
+function 检查浏览器兼容性() {
+  if (typeof navigator === 'undefined') return;
+  const 信息 = 读取浏览器信息();
+  if (信息 && 信息.版本 >= 最低浏览器版本) return;
+  弹窗提示浏览器升级(信息);
+}
+
+// Chrome/Edge 从 UA 里取主版本号;其余内核一律按不受支持处理。新版 Edge 的
+// UA 同时带 Chrome/ 与 Edg/,旧版 EdgeHTML 的 UA 则带 Chrome/ 与 Edge/,两种
+// 都先于 Chrome/ 匹配,拿到的才是 Edge 自己的版本号。
+function 读取浏览器信息() {
+  const ua = navigator.userAgent;
+  const edge = ua.match(/Edg\/(\d+)/);
+  if (edge) return { 名称: 'Edge', 版本: Number(edge[1]) };
+  const 旧版edge = ua.match(/Edge\/(\d+)/);
+  if (旧版edge) return { 名称: 'Edge', 版本: Number(旧版edge[1]) };
+  const chrome = ua.match(/Chrome\/(\d+)/);
+  if (chrome) return { 名称: 'Chrome', 版本: Number(chrome[1]) };
+  return null;
+}
+
+// 弹窗要等 body 就绪;引导脚本 document-start 运行,此时多半还没有 body。
+function 弹窗提示浏览器升级(信息) {
+  if (!globalThis.document) return;
+  if (!document.body) {
+    document.addEventListener(
+      'DOMContentLoaded',
+      function () {
+        弹窗提示浏览器升级(信息);
+      },
+      { once: true },
+    );
+    return;
+  }
+  document.body.appendChild(创建升级提示弹窗(信息));
+}
+
+function 创建升级提示弹窗(信息) {
+  const 遮罩 = document.createElement('div');
+  遮罩.id = 'gio-browser-warning';
+  Object.assign(遮罩.style, {
+    position: 'fixed',
+    inset: '0',
+    zIndex: '2147483647',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    background: 'rgba(0, 0, 0, 0.55)',
+  });
+  const 卡片 = document.createElement('div');
+  Object.assign(卡片.style, {
+    width: 'min(420px, calc(100vw - 48px))',
+    boxSizing: 'border-box',
+    padding: '24px 28px',
+    border: '1px solid rgba(0, 190, 190, 0.55)',
+    borderTop: '3px solid #00b7b7',
+    borderRadius: '6px',
+    background: 'rgba(24, 31, 32, 0.97)',
+    boxShadow: '0 8px 32px rgba(0, 0, 0, 0.5)',
+    color: '#f4ffff',
+    fontFamily: '"Microsoft YaHei", sans-serif',
+    textAlign: 'center',
+  });
+  const 标题 = document.createElement('div');
+  标题.textContent = 信息 ? '浏览器版本过低' : '浏览器不受支持';
+  Object.assign(标题.style, {
+    fontSize: '17px',
+    fontWeight: '700',
+    marginBottom: '12px',
+  });
+  const 说明 = document.createElement('div');
+  说明.textContent = 信息
+    ? `当前为 ${信息.名称} ${信息.版本},建议使用 ${信息.名称} ${最低浏览器版本} 及以上版本,否则插件可能无法正常运行。`
+    : `当前浏览器不受支持,请使用 Chrome 或 Edge ${最低浏览器版本} 及以上版本,否则插件可能无法正常运行。`;
+  Object.assign(说明.style, {
+    fontSize: '13px',
+    lineHeight: '1.7',
+    color: '#bfd9d9',
+    marginBottom: '18px',
+  });
+  const 按钮 = document.createElement('button');
+  按钮.type = 'button';
+  按钮.textContent = '我知道了';
+  Object.assign(按钮.style, {
+    padding: '7px 28px',
+    border: 'none',
+    borderRadius: '3px',
+    background: '#00b7b7',
+    color: '#04222a',
+    fontFamily: 'inherit',
+    fontSize: '13px',
+    fontWeight: '700',
+    cursor: 'pointer',
+  });
+  按钮.addEventListener('click', function () {
+    // 老内核浏览器可能没有 Element.remove(),退回 parentNode 移除。
+    if (遮罩.remove) 遮罩.remove();
+    else if (遮罩.parentNode) 遮罩.parentNode.removeChild(遮罩);
+  });
+  卡片.appendChild(标题);
+  卡片.appendChild(说明);
+  卡片.appendChild(按钮);
+  遮罩.appendChild(卡片);
+  return 遮罩;
+}
+
+// ---- 回放页全局加载 ----
+// 回放页没有主菜单,「正在加载」占位按钮没有挂载点;插件从远程拉取/导入期间
+// 给整个回放页盖一层全局 loading,导入成功或失败后再撤掉,避免回放画面先于
+// 插件渲染、功能闪烁出现。
+// 遮罩期间回放「不可操作、不可往下走」:鼠标被遮罩挡住、键盘被捕获阶段拦掉,
+// 剩下的自动播放也一并暂停(见 启动回放暂停轮询),插件没生效前回放不会推进
+// 任何一回合。
+function 是否回放页() {
+  if (typeof location === 'undefined') return false;
+  return 回放路径前缀.test(location.pathname);
+}
+
+function 启动回放加载遮罩() {
+  if (!是否回放页() || !globalThis.document) return;
+  if (!document.body) {
+    document.addEventListener('DOMContentLoaded', 启动回放加载遮罩, {
+      once: true,
+    });
+    return;
+  }
+  // 插件可能已经先一步导入完成(网络快于 DOM),此时不再盖遮罩。
+  if (导入完成时刻 || 加载已失败) return;
+  回放加载遮罩 = 创建回放加载遮罩();
+  document.body.appendChild(回放加载遮罩);
+  // 遮罩是普通 fixed 元素,只挡鼠标:键盘事件不认遮挡,照旧穿到页面,而回放页
+  // 的 WASD/方向键行军与官方回放快捷键都挂在 window/document 上,加载中乱按会
+  // 提前驱动回放。因此在 window 捕获阶段拦掉三种键盘事件——捕获阶段最先跑,
+  // stopImmediatePropagation 连页面自己后注册的捕获监听一起挡住,事件不会往下
+  // 走到 document 与目标元素;遮罩撤除时用同一个 AbortController 一次性解除,
+  // 三种事件、单个 signal,不会漏解绑。
+  回放键盘屏蔽 = new AbortController();
+  for (const 类型 of ['keydown', 'keypress', 'keyup']) {
+    window.addEventListener(类型, 屏蔽键盘操作, {
+      capture: true,
+      signal: 回放键盘屏蔽.signal,
+    });
+  }
+  // 回放页会按用户设置自动播放(official localStorage.replay_auto_play):
+  // 遮罩只挡得住鼠标与键盘,挡不住回放自己往下走,而插件从远程拉取 + 导入
+  // 要几百毫秒到几秒,这段空档里回放早把开局窗口内的聊天 dispatch 进 redux
+  // 了,插件装好拦截器也追不回来。所以遮罩期间直接把回放的自动播放关掉,
+  // 撤遮罩时再恢复:插件生效前回放一步都不走,也就没有漏网的聊天。
+  启动回放暂停轮询();
+  // 兜底:CDN 断连等场景下导入可能长时间挂起,遮罩不能永久盖住回放页,
+  // 到点强制移除;后续成功/失败路径各自再取消一次,幂等无副作用。
+  回放加载超时 = setTimeout(取消回放加载遮罩, 回放加载宽限);
+
+  function 屏蔽键盘操作(事件) {
+    事件.preventDefault();
+    事件.stopImmediatePropagation();
+  }
+}
+
+// 从 #game-page 节点上挂的 React fiber 键沿 return 链向上找带 store 的组件
+// fiber(react-redux Provider 的 props.store),与插件内部 读取页面redux仓库
+// 同一口径。引导脚本要早于插件本体运行,所以这段判定在两边各留一份。
+function 读取页面redux仓库() {
+  const 节点 = document.getElementById('game-page');
+  if (!节点) return null;
+  for (const 键 of Object.getOwnPropertyNames(节点)) {
+    if (
+      !fiber键前缀列表.some(function (前缀) {
+        return 键.startsWith(前缀);
+      })
+    ) {
+      continue;
+    }
+    let fiber = 节点[键];
+    for (let 跳 = 0; fiber && 跳 < fiber上行跳数上限; 跳 += 1) {
+      const 仓库 = fiber.memoizedProps && fiber.memoizedProps.store;
+      if (
+        typeof 仓库?.getState === 'function' &&
+        typeof 仓库?.dispatch === 'function'
+      ) {
+        return 仓库;
+      }
+      fiber = fiber.return;
+    }
+  }
+  return null;
+}
+
+// 暂停轮询用自排程 setTimeout,与占位按钮那套一致(不额外引入 setInterval),
+// 遮罩撤除即结束。
+function 启动回放暂停轮询() {
+  if (回放暂停轮询) return;
+  尝试暂停回放();
+}
+
+// 遮罩期间只要发现回放在自动播放就关掉它。轮询一直跑到撤遮罩为止:官方是
+// 在回放数据到达之后才 dispatch 自动播放的,「这一拍没开」不代表下一拍不开;
+// 用户自己没开自动播放时这里从头到尾都不发动作,撤遮罩时也就不会替他点开。
+function 尝试暂停回放() {
+  回放暂停轮询 = null;
+  if (!回放加载遮罩) return;
+  const 仓库 = 读取页面redux仓库();
+  const 游戏状态 = 仓库?.getState?.()?.game;
+  if (游戏状态?.isReplay && 游戏状态.autoPlay) {
+    回放被暂停的仓库 = 仓库;
+    仓库.dispatch({ type: 官方设置自动播放动作, val: false });
+  }
+  回放暂停轮询 = setTimeout(尝试暂停回放, 回放暂停轮询间隔);
+}
+
+function 停止回放暂停轮询() {
+  if (!回放暂停轮询) return;
+  clearTimeout(回放暂停轮询);
+  回放暂停轮询 = null;
+}
+
+// 撤遮罩时恢复:只有「确实被我们暂停过」才恢复自动播放,用户自己没开
+// 自动播放时不会被引导脚本点开。
+function 恢复回放自动播放() {
+  停止回放暂停轮询();
+  const 仓库 = 回放被暂停的仓库;
+  回放被暂停的仓库 = null;
+  if (仓库) 仓库.dispatch({ type: 官方设置自动播放动作, val: true });
+}
+
+function 取消回放加载遮罩(失败) {
+  const 遮罩 = 回放加载遮罩;
+  // 已撤除(或从没盖过)时重复调用直接返回:后面的失败文案定时器还排着队,
+  // 不能在这里顺手把它清掉,否则遮罩就再也没人撤了。
+  if (!遮罩) return;
+  回放加载遮罩 = null;
+  if (回放加载超时) {
+    clearTimeout(回放加载超时);
+    回放加载超时 = null;
+  }
+  if (失败) {
+    // 失败文案短暂停留再移除,既给了反馈又不把回放页卡死;停留期间遮罩还
+    // 盖着,键盘照旧屏蔽,直到遮罩真正撤除才解除。
+    if (遮罩.文案) 遮罩.文案.textContent = '插件加载失败';
+    回放加载超时 = setTimeout(function () {
+      撤除遮罩(遮罩);
+    }, 回放失败停留);
+    return;
+  }
+  撤除遮罩(遮罩);
+}
+
+// 遮罩撤除的唯一出口:移掉节点、解除键盘屏蔽、恢复被暂停的回放自动播放。
+// 老内核可能没有 Element.remove(),退回 parentNode 移除(与升级弹窗同口径)。
+function 撤除遮罩(遮罩) {
+  if (遮罩.remove) 遮罩.remove();
+  else if (遮罩.parentNode) 遮罩.parentNode.removeChild(遮罩);
+  回放加载超时 = null;
+  回放键盘屏蔽?.abort();
+  回放键盘屏蔽 = null;
+  恢复回放自动播放();
+}
+
+function 创建回放加载遮罩() {
+  const 遮罩 = document.createElement('div');
+  遮罩.id = 'gio-replay-loading';
+  Object.assign(遮罩.style, {
+    position: 'fixed',
+    inset: '0',
+    zIndex: '2147483647',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: '14px',
+    background: 'rgba(15, 20, 21, 0.96)',
+    color: '#f4ffff',
+    fontFamily: '"Microsoft YaHei", sans-serif',
+  });
+  const 圈 = document.createElement('div');
+  Object.assign(圈.style, {
+    width: '34px',
+    height: '34px',
+    borderRadius: '50%',
+    border: '3px solid rgba(0, 183, 183, 0.25)',
+    borderTopColor: '#00b7b7',
+  });
+  // 转圈用 WAAPI,与主菜单占位同一套;不支持的环境退化为静止圈。
+  if (typeof 圈.animate === 'function') {
+    圈.animate(
+      [{ transform: 'rotate(0deg)' }, { transform: 'rotate(360deg)' }],
+      { duration: 800, iterations: Infinity },
+    );
+  }
+  const 文案 = document.createElement('div');
+  文案.id = 'gio-replay-loading-text';
+  文案.textContent = '正在加载';
+  Object.assign(文案.style, { fontSize: '15px' });
+  const 副文案 = document.createElement('div');
+  副文案.textContent = '回放插件加载中,请稍候';
+  Object.assign(副文案.style, { fontSize: '12px', color: '#8fb4b4' });
+  遮罩.appendChild(圈);
+  遮罩.appendChild(文案);
+  遮罩.appendChild(副文案);
+  // 失败时把主文案换成失败提示;挂在遮罩上便于取消时直接取用。
+  遮罩.文案 = 文案;
+  return 遮罩;
+}
+
 // 模块顶层就会创建真控制台按钮(src/main.js),导入完成即立刻查一次:真
 // 按钮通常已就位,占位当场原地换成「☰ 控制台」,几乎无重叠或空档。
 function 通知导入完成() {
   导入完成时刻 = Date.now();
+  取消回放加载遮罩();
   轮询一次();
 }
 
 function 标记加载失败(错误) {
   加载已失败 = true;
   console.error('[gnrs] 插件加载失败', 错误);
+  取消回放加载遮罩(true);
   应用失败样式();
 }
 
@@ -246,3 +575,11 @@ function 创建占位按钮() {
 }
 
 启动加载占位();
+启动回放加载遮罩(); // 非回放页内部直接跳过
+
+// 浏览器检查是纯提示,任何一环异常都不该拖累占位与插件加载。
+try {
+  检查浏览器兼容性();
+} catch (错误) {
+  console.warn('[gnrs] 浏览器版本检查失败', 错误);
+}
