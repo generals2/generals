@@ -7,6 +7,10 @@
 // @run-at       document-start
 // ==/UserScript==
 
+// 引导脚本自身的版本号:插件上报对局记录时会连同浏览器版本一起带给本地服务,
+// 便于按引导脚本版本排查问题。旧版引导脚本不写这个值,上报里就没有该字段。
+window.bootVerison = '9.13-1';
+
 const bootfile = 'dist/gnrs';
 const 站点地址缓存键 = 'gnrs-site';
 
